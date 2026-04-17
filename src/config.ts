@@ -1,7 +1,7 @@
 import { DEFAULT_TIMEOUT_MS } from './constants.js';
 import type { ChatPlatform } from './prompts/index.js';
 
-export type AgentBackend = 'claude-code' | 'codex' | 'gemini' | 'local-llm';
+export type AgentBackend = 'claude-code' | 'claw-code' | 'codex' | 'gemini' | 'local-llm';
 
 export interface AgentConfig {
   model?: string;
@@ -79,12 +79,13 @@ export function loadConfig(): Config {
   const backend = (process.env.AGENT_BACKEND || 'claude-code') as AgentBackend;
   if (
     backend !== 'claude-code' &&
+    backend !== 'claw-code' &&
     backend !== 'codex' &&
     backend !== 'gemini' &&
     backend !== 'local-llm'
   ) {
     throw new Error(
-      `Invalid AGENT_BACKEND: ${backend}. Must be 'claude-code', 'codex', 'gemini', or 'local-llm'`
+      `Invalid AGENT_BACKEND: ${backend}. Must be 'claude-code', 'claw-code', 'codex', 'gemini', or 'local-llm'`
     );
   }
 

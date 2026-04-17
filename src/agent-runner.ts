@@ -1,5 +1,6 @@
 import type { AgentBackend, AgentConfig } from './config.js';
 import { ClaudeCodeRunner } from './claude-code.js';
+import { ClawCodeRunner } from './claw-code.js';
 import { CodexRunner } from './codex-cli.js';
 import { GeminiRunner } from './gemini-cli.js';
 import { LocalLlmRunner } from './local-llm/runner.js';
@@ -55,6 +56,8 @@ export function createAgentRunner(
         });
       }
       return new ClaudeCodeRunner({ ...config, platform: options?.platform });
+    case 'claw-code':
+      return new ClawCodeRunner({ ...config, platform: options?.platform });
     case 'codex':
       return new CodexRunner(config);
     case 'gemini':
@@ -102,6 +105,8 @@ export function getBackendDisplayName(backend: AgentBackend): string {
   switch (backend) {
     case 'claude-code':
       return 'Claude Code';
+    case 'claw-code':
+      return 'Claw Code';
     case 'codex':
       return 'Codex';
     case 'gemini':
