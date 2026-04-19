@@ -27,7 +27,7 @@ import {
   buildPromptWithAttachments,
 } from './file-utils.js';
 import { initSettings, loadSettings, saveSettings, formatSettings } from './settings.js';
-import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH, STREAM_UPDATE_INTERVAL_MS } from './constants.js';
+import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH } from './constants.js';
 import {
   Scheduler,
   parseScheduleInput,
@@ -768,7 +768,7 @@ async function main() {
           const typedChannel = channel as {
             send: (options: {
               content: string;
-              allowedMentions: { parse: never[] };
+              allowedMentions: { parse: Array<'users'>; repliedUser: false };
             }) => Promise<unknown>;
           };
           // 2000文字制限に合わせて分割送信
@@ -776,7 +776,8 @@ async function main() {
           for (const chunk of chunks) {
             await typedChannel.send({
               content: chunk,
-              allowedMentions: { parse: [] },
+              // ユーザーメンションだけ有効化する。@everyone やロールメンションは許可しない。
+              allowedMentions: { parse: ['users'], repliedUser: false },
             });
           }
           const channelName = 'name' in channel ? channel.name : 'unknown';
@@ -1301,25 +1302,16 @@ async function main() {
     console.error('[xangi] Discord client error:', error.message);
   });
 
-  // チャンネル単位の処理中ロック
-  const processingChannels = new Set<string>();
-
   // メッセージ処理
   client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot) return;
+    // 他 bot には反応するが、自分自身の発言には反応しない
+    if (message.author.id === client.user?.id) return;
 
-    const isMentioned = message.mentions.has(client.user!);
-    const isDM = !message.guild;
-    const isAutoReplyChannel =
-      config.discord.autoReplyChannels?.includes(message.channel.id) ?? false;
-
-    if (!isMentioned && !isDM && !isAutoReplyChannel) return;
-
-    // 同じチャンネルで処理中なら無視（メンション時は除く）
-    if (!isMentioned && processingChannels.has(message.channel.id)) {
-      console.log(`[xangi] Skipping message in busy channel: ${message.channel.id}`);
-      return;
-    }
+    const isMentioned = message.mentions.has(client.user!, {
+      ignoreRepliedUser: true,
+    });
+    console.log(`[xangi] isMentioned: ${isMentioned}`);
+    if (!isMentioned) return;
 
     if (
       !config.discord.allowedUsers?.includes('*') &&
@@ -1329,8 +1321,9 @@ async function main() {
       return;
     }
 
+    const selfMentionRegex = new RegExp(`<@!?${client.user!.id}>`, 'g');
     let prompt = message.content
-      .replace(/<@[!&]?\d+>/g, '') // ユーザーメンションのみ削除（チャンネルメンションは残す）
+      .replace(selfMentionRegex, '') // xangi自身へのメンションのみ削除（他ユーザー/bot/チャンネルメンションは残す）
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -1422,7 +1415,6 @@ async function main() {
       prompt = `[現在時刻: ${now}(${day})]\n${prompt}`;
     }
 
-    processingChannels.add(channelId);
     try {
       const result = await processPrompt(
         message,
@@ -1455,8 +1447,8 @@ async function main() {
           }
         }
       }
-    } finally {
-      processingChannels.delete(channelId);
+    } catch (err) {
+      console.error('[xangi] Message processing failed:', err);
     }
   });
 
@@ -1952,7 +1944,7 @@ async function processPrompt(
 
     // 最初のメッセージを送信
     const showButtons = config.discord.showButtons ?? true;
-    replyMessage = await message.reply({
+    const thinkingMessage = await message.reply({
       content: '🤔 考え中.',
       ...(showButtons && { components: [createStopButton()] }),
     });
@@ -1962,8 +1954,7 @@ async function processPrompt(
 
     if (useStreaming && showThinking && !needsSkipRunner) {
       // ストリーミング + 思考表示モード（persistent-runner のみ）
-      let lastUpdateTime = 0;
-      let pendingUpdate = false;
+      // 考え中メッセージは編集せず、思考完了後に別メッセージとして回答を送信（bot同士の会話対応）
       let firstTextReceived = false;
 
       // 最初のテキストが届くまで考え中アニメーション
@@ -1973,7 +1964,7 @@ async function processPrompt(
         dotCount = (dotCount % 3) + 1;
         const dots = '.'.repeat(dotCount);
         const toolDisplay = toolHistory.length > 0 ? '\n' + toolHistory.join('\n') : '';
-        replyMessage!.edit(`🤔 考え中${dots}${toolDisplay}`).catch(() => {});
+        thinkingMessage.edit(`🤔 考え中${dots}${toolDisplay}`).catch(() => {});
       }, 1000);
 
       let streamResult: { result: string; sessionId: string };
@@ -1987,19 +1978,6 @@ async function processPrompt(
                 firstTextReceived = true;
                 clearInterval(thinkingInterval);
               }
-              const now = Date.now();
-              if (now - lastUpdateTime >= STREAM_UPDATE_INTERVAL_MS && !pendingUpdate) {
-                pendingUpdate = true;
-                lastUpdateTime = now;
-                replyMessage!
-                  .edit((fullText + ' ▌').slice(0, DISCORD_MAX_LENGTH))
-                  .catch((err) => {
-                    console.error('[xangi] Failed to edit message:', err.message);
-                  })
-                  .finally(() => {
-                    pendingUpdate = false;
-                  });
-              }
             },
             onToolUse: (toolName, toolInput) => {
               // ツール実行履歴に追加
@@ -2007,7 +1985,7 @@ async function processPrompt(
               toolHistory.push(`🔧 ${toolName}${inputSummary}`);
               if (!firstTextReceived) {
                 const toolDisplay = toolHistory.join('\n');
-                replyMessage!.edit(`🤔 考え中...\n${toolDisplay}`).catch(() => {});
+                thinkingMessage.edit(`🤔 考え中...\n${toolDisplay}`).catch(() => {});
               }
             },
           },
@@ -2023,13 +2001,22 @@ async function processPrompt(
       }
       result = streamResult.result;
       newSessionId = streamResult.sessionId;
+
+      // ストリーミング完了後に考え中メッセージを更新（ボタンを削除）
+      const toolDisplayFinal = toolHistory.length > 0 ? '\n' + toolHistory.join('\n') : '';
+      await thinkingMessage
+        .edit({
+          content: `✅ 思考完了${toolDisplayFinal}`,
+          components: [],
+        })
+        .catch(() => {});
     } else {
       // 非ストリーミング or ワンショットskipランナー
       let dotCount = 1;
       const thinkingInterval = setInterval(() => {
         dotCount = (dotCount % 3) + 1;
         const dots = '.'.repeat(dotCount);
-        replyMessage!.edit(`🤔 考え中${dots}`).catch(() => {});
+        thinkingMessage.edit(`🤔 考え中${dots}`).catch(() => {});
       }, 1000);
 
       try {
@@ -2043,6 +2030,13 @@ async function processPrompt(
         newSessionId = runResult.sessionId;
       } finally {
         clearInterval(thinkingInterval);
+        // 思考完了メッセージを更新（ボタンを削除）
+        await thinkingMessage
+          .edit({
+            content: '✅ 思考完了',
+            components: [],
+          })
+          .catch(() => {});
       }
     }
 
@@ -2074,9 +2068,9 @@ async function processPrompt(
           .filter(Boolean)
       : [cleanText];
 
-    // 最初のパートは既存のreplyMessageを編集して送信
+    // 最初のパートは別メッセージとして送信（bot同士の会話対応）
     const firstChunks = splitMessage(messageParts[0], DISCORD_SAFE_LENGTH);
-    await replyMessage!.edit({
+    replyMessage = await message.reply({
       content: firstChunks[0] || '✅',
       ...(showButtons && { components: [createCompletedButtons()] }),
     });
