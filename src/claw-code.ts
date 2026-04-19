@@ -85,7 +85,7 @@ export class ClawCodeRunner implements AgentRunner {
     console.log(`[claw-code] Executing in ${this.workdir || 'default dir'}${sessionInfo}`);
 
     if (options?.channelId && this.workdir) {
-      logPrompt(this.workdir, options.channelId, fullPrompt, options?.sessionId);
+      logPrompt(this.workdir, options.channelId, fullPrompt);
     }
 
     const stdout = await this.execute(args, options?.channelId);
