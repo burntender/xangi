@@ -21,9 +21,11 @@ logs/
 
 # Claude Code
 .claude/
+.claw/
 
 # Workspace
 workspace/*
 !workspace/.gitkeep
 .xangi/
 models/
+.sandbox-*/
