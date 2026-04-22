@@ -5,10 +5,19 @@
  * セッション単位のログ（logs/sessions/<appSessionId>.jsonl）で管理。
  */
 import { createServer } from 'http';
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'fs';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  statSync,
+  mkdirSync,
+  unlinkSync,
+} from 'fs';
 import { join, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
 import type { AgentRunner } from './agent-runner.js';
+import { sendDiscordMessage } from './cli/discord-api.js';
 import {
   getSession,
   setSession,
@@ -31,6 +40,14 @@ const __dirname = dirname(__filename);
 
 const DEFAULT_PORT = 18888;
 const WEB_CHANNEL_ID = 'web-chat';
+const AUDIO_API_CHANNEL_PREFIX = 'audio-api';
+const AUDIO_CHAT_SYSTEM_PROMPT = [
+  '以下は音声読み上げ前提の返答です。',
+  '記号や絵文字や箇条書きを多用しないでください。',
+  'URL、Markdown、コードブロック、括弧だらけの表現は避けてください。',
+  '自然に読み上げやすい短めの日本語で返答してください。',
+  '一文ごとに簡潔にし、返答全体は長くなりすぎないようにしてください。',
+].join('\n');
 
 // resume後の最初のメッセージにセッション履歴を注入するためのフラグ
 let resumedAppSessionId: string | null = null;
@@ -38,6 +55,131 @@ let resumedAppSessionId: string | null = null;
 interface WebChatOptions {
   agentRunner: AgentRunner;
   port?: number;
+}
+
+interface ParsedMultipartField {
+  name: string;
+  value: string;
+}
+
+interface ParsedMultipartFile {
+  fieldName: string;
+  filename: string;
+  contentType: string;
+  path: string;
+}
+
+interface ParsedMultipartResult {
+  fields: Record<string, string>;
+  files: ParsedMultipartFile[];
+}
+
+async function parseMultipart(
+  req: import('http').IncomingMessage,
+  uploadDir: string
+): Promise<ParsedMultipartResult> {
+  mkdirSync(uploadDir, { recursive: true });
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(chunk as Buffer);
+  }
+  const body = Buffer.concat(chunks);
+
+  const contentType = req.headers['content-type'] || '';
+  const boundaryMatch = contentType.match(/boundary=(.+)/);
+  if (!boundaryMatch) {
+    throw new Error('No boundary in content-type');
+  }
+
+  const boundary = '--' + boundaryMatch[1];
+  const parts = body.toString('binary').split(boundary);
+  const fields: ParsedMultipartField[] = [];
+  const files: ParsedMultipartFile[] = [];
+
+  for (const part of parts) {
+    const headerEnd = part.indexOf('\r\n\r\n');
+    if (headerEnd === -1) continue;
+
+    const headers = part.slice(0, headerEnd);
+    const nameMatch = headers.match(/name="([^"]+)"/);
+    if (!nameMatch) continue;
+    const fieldName = nameMatch[1];
+    const filenameMatch = headers.match(/filename="([^"]+)"/);
+
+    const dataStart = headerEnd + 4;
+    const dataEnd = part.endsWith('\r\n') ? part.length - 2 : part.length;
+    const rawData = part.slice(dataStart, dataEnd);
+
+    if (filenameMatch) {
+      const filename = filenameMatch[1];
+      const ext = extname(filename).toLowerCase();
+      const safeName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+      const filePath = join(uploadDir, safeName);
+      const fileData = Buffer.from(rawData, 'binary');
+      writeFileSync(filePath, fileData);
+      const contentTypeMatch = headers.match(/Content-Type:\s*([^\r\n]+)/i);
+      files.push({
+        fieldName,
+        filename,
+        contentType: contentTypeMatch?.[1] || 'application/octet-stream',
+        path: filePath,
+      });
+    } else {
+      fields.push({ name: fieldName, value: Buffer.from(rawData, 'binary').toString('utf-8') });
+    }
+  }
+
+  return {
+    fields: Object.fromEntries(fields.map((f) => [f.name, f.value])),
+    files,
+  };
+}
+
+async function callAudioTranscription(
+  audioPath: string,
+  options?: { language?: string }
+): Promise<string> {
+  const form = new FormData();
+  const buffer = readFileSync(audioPath);
+  const mimeType =
+    extname(audioPath).toLowerCase() === '.wav' ? 'audio/wav' : 'application/octet-stream';
+  form.append(
+    'file',
+    new Blob([buffer], { type: mimeType }),
+    extname(audioPath) ? audioPath.split('/').pop() || 'audio.wav' : 'audio.wav'
+  );
+  form.append('response_format', 'json');
+  if (options?.language) form.append('language', options.language);
+
+  const baseUrl = (process.env.XANGI_AUDIO_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
+  const res = await fetch(`${baseUrl}/v1/audio/transcriptions`, { method: 'POST', body: form });
+  if (!res.ok) {
+    throw new Error(`STT failed: ${res.status} ${await res.text()}`);
+  }
+  const payload = (await res.json()) as { text?: string };
+  return payload.text || JSON.stringify(payload);
+}
+
+async function callAudioSpeech(text: string): Promise<{ buffer: Buffer; contentType: string }> {
+  const baseUrl = (process.env.XANGI_AUDIO_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
+  const ttsModel = process.env.XANGI_AUDIO_TTS_MODEL || 'tsukuyomi-chan-6lang-fp16';
+  const res = await fetch(`${baseUrl}/v1/audio/speech`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: ttsModel,
+      input: text,
+      response_format: 'wav',
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`TTS failed: ${res.status} ${await res.text()}`);
+  }
+  return {
+    buffer: Buffer.from(await res.arrayBuffer()),
+    contentType: res.headers.get('content-type') || 'audio/wav',
+  };
 }
 
 export function startWebChat(options: WebChatOptions): void {
@@ -257,50 +399,98 @@ export function startWebChat(options: WebChatOptions): void {
       return;
     }
 
+    // POST /api/audio-chat — 外部PC向け音声対話API
+    if (url === '/api/audio-chat' && req.method === 'POST') {
+      const apiKey = process.env.XANGI_AUDIO_CHAT_API_KEY;
+      const incomingApiKey = req.headers['x-api-key'];
+      if (apiKey && incomingApiKey !== apiKey) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+
+      let tempAudioPath: string | null = null;
+      try {
+        const uploadDir = join(workdir, 'tmp', 'audio-api');
+        const { fields, files } = await parseMultipart(req, uploadDir);
+        const audioFile = files.find((f) => f.fieldName === 'file') || files[0];
+        if (!audioFile) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'audio file is required' }));
+          return;
+        }
+        tempAudioPath = audioFile.path;
+
+        const channelId = fields.channel_id || process.env.XANGI_AUDIO_CHAT_CHANNEL_ID || '';
+        if (!channelId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'channel_id is required' }));
+          return;
+        }
+
+        const language = fields.language || 'ja';
+        const transcript = await callAudioTranscription(audioFile.path, { language });
+        const transcriptSend = await sendDiscordMessage(channelId, transcript);
+        const transcriptMessageId = transcriptSend.messageIds[0];
+
+        const prompt = [
+          '[プラットフォーム: Audio API]',
+          `[チャンネル: ${channelId}]`,
+          AUDIO_CHAT_SYSTEM_PROMPT,
+          '',
+          `ユーザー音声の文字起こし: ${transcript}`,
+        ].join('\n');
+
+        const audioChannelId = `${AUDIO_API_CHANNEL_PREFIX}:${channelId}`;
+        const runResult = await agentRunner.run(prompt, {
+          channelId: audioChannelId,
+        });
+        const replyText = runResult.result.trim();
+
+        const replySend = await sendDiscordMessage(channelId, replyText, {
+          replyToMessageId: transcriptMessageId,
+        });
+
+        const speech = await callAudioSpeech(replyText);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            transcript,
+            replyText,
+            discord: {
+              channelId,
+              transcriptMessageId,
+              replyMessageId: replySend.messageIds[0],
+            },
+            audio: {
+              contentType: speech.contentType,
+              base64: speech.buffer.toString('base64'),
+            },
+          })
+        );
+      } catch (err) {
+        console.error('[web-chat] audio-chat error:', err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: err instanceof Error ? err.message : 'audio chat failed',
+          })
+        );
+      } finally {
+        if (tempAudioPath && existsSync(tempAudioPath)) {
+          unlinkSync(tempAudioPath);
+        }
+      }
+      return;
+    }
+
     // POST /api/upload — ファイルアップロード
     if (url === '/api/upload' && req.method === 'POST') {
       try {
         const uploadDir = join(workdir, 'tmp', 'web-uploads');
-        mkdirSync(uploadDir, { recursive: true });
-
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) {
-          chunks.push(chunk as Buffer);
-        }
-        const body = Buffer.concat(chunks);
-
-        // multipart/form-data をパース（簡易実装）
-        const contentType = req.headers['content-type'] || '';
-        const boundaryMatch = contentType.match(/boundary=(.+)/);
-        if (!boundaryMatch) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'No boundary in content-type' }));
-          return;
-        }
-        const boundary = '--' + boundaryMatch[1];
-        const parts = body.toString('binary').split(boundary);
-
-        const files: { name: string; path: string }[] = [];
-        for (const part of parts) {
-          const headerEnd = part.indexOf('\r\n\r\n');
-          if (headerEnd === -1) continue;
-          const headers = part.slice(0, headerEnd);
-          const filenameMatch = headers.match(/filename="([^"]+)"/);
-          if (!filenameMatch) continue;
-
-          const filename = filenameMatch[1];
-          const ext = extname(filename).toLowerCase();
-          const safeName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
-          const filePath = join(uploadDir, safeName);
-
-          // バイナリデータを取り出し（末尾の\r\nを除去）
-          const dataStart = headerEnd + 4;
-          const dataEnd = part.length - 2; // trailing \r\n
-          const fileData = Buffer.from(part.slice(dataStart, dataEnd), 'binary');
-          writeFileSync(filePath, fileData);
-
-          files.push({ name: filename, path: filePath });
-        }
+        const parsed = await parseMultipart(req, uploadDir);
+        const files = parsed.files.map((file) => ({ name: file.filename, path: file.path }));
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ files }));

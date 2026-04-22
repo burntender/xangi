@@ -228,7 +228,7 @@ async function main() {
   initSessions(dataDir);
 
   // WebチャットUI起動
-  if (process.env.WEB_CHAT_ENABLED === 'true') {
+  if (process.env.WEB_CHAT_ENABLED === 'true' || process.env.AUDIO_CHAT_API_ENABLED === 'true') {
     startWebChat({ agentRunner });
   }
 

@@ -1,0 +1,46 @@
+# Piper-plus Environment (CUDA 13.1.1)
+# TTS with piper-plus (CPU inference)
+FROM kazi1024/xangi-cuda-base:latest AS base
+
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install uv (modern Python package manager) in common venv
+RUN /opt/common-venv/bin/pip install --upgrade uv
+
+# Install piper-plus (CPU inference - GPU requires onnxruntime-gpu which may not have ARM64 wheels)
+RUN /opt/common-venv/bin/pip install piper-plus
+
+# Install Gradio for WebUI (optional)
+RUN /opt/common-venv/bin/pip install gradio
+
+# Pre-download NLTK data for g2p-en (in common virtual environment)
+ENV NLTK_DATA=/usr/share/nltk_data
+RUN /opt/common-venv/bin/python -c "import nltk; nltk.download('averaged_perceptron_tagger', download_dir='/usr/share/nltk_data'); nltk.download('averaged_perceptron_tagger_eng', download_dir='/usr/share/nltk_data'); nltk.download('cmudict', download_dir='/usr/share/nltk_data')"
+
+# Create directories for models and output
+RUN mkdir -p /app/models /app/output
+
+# Copy API server script
+COPY docker/piper_api_server.py /app/
+
+# Expose ports (API: 8000, WebUI: 7860)
+EXPOSE 8000 7860
+
+ENV GRADIO_SERVER_NAME=0.0.0.0
+ENV GRADIO_SERVER_PORT=7860
+
+# Create non-root user for security
+RUN useradd -m -u 1001 piper && \
+    chown -R piper:piper /app/models /app/output
+USER piper
+
+# Default command (can be overridden in docker-compose)
+CMD ["echo", "piper-plus started"]

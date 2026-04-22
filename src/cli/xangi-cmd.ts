@@ -11,7 +11,7 @@
  *
  * 使い方:
  *   node xangi-cmd.js discord_history --channel <id> [--count <n>] [--offset <n>]
- *   node xangi-cmd.js discord_send --channel <id> --message <text>
+ *   node xangi-cmd.js discord_send --channel <id> --message <text> [--reply-to-message-id <id>]
  *   node xangi-cmd.js discord_channels --guild <id>
  *   node xangi-cmd.js discord_search --channel <id> --keyword <text>
  *   node xangi-cmd.js discord_edit --channel <id> --message-id <id> --content <text>
@@ -21,12 +21,18 @@
  *   node xangi-cmd.js schedule_remove --id <id>
  *   node xangi-cmd.js schedule_toggle --id <id>
  *   node xangi-cmd.js media_send --channel <id> --file <path>
+ *   node xangi-cmd.js audio_transcribe --file <path> [--language <ja>] [--response-format <json|text|verbose_json>]
+ *   node xangi-cmd.js audio_speech --input <text> [--output <path>] [--format <wav|mp3>]
+ *   node xangi-cmd.js audio_health
+ *   node xangi-cmd.js audio_models
+ *   node xangi-cmd.js audio_backends
  *   node xangi-cmd.js system_restart
  *   node xangi-cmd.js system_settings --key <key> --value <value>
  */
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { audioApi } from './audio-api.js';
 import { discordApi } from './discord-api.js';
 import { scheduleCmd } from './schedule-cmd.js';
 import { systemCmd } from './system-cmd.js';
@@ -109,6 +115,11 @@ Discord操作:
 
 その他:
   media_send        ファイル送信
+  audio_transcribe  音声文字起こし
+  audio_speech      音声合成
+  audio_health      音声APIヘルス確認
+  audio_models      音声モデル一覧
+  audio_backends    音声バックエンド確認
   system_restart    再起動
   system_settings   設定変更`);
     return;
@@ -123,6 +134,8 @@ Discord操作:
       result = await scheduleCmd(command, flags);
     } else if (command === 'media_send') {
       result = await discordApi(command, flags);
+    } else if (command.startsWith('audio_')) {
+      result = await audioApi(command, flags);
     } else if (command.startsWith('system_')) {
       result = await systemCmd(command, flags);
     } else {

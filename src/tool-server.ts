@@ -9,6 +9,7 @@
  * xangi-cmdを使う子プロセスへ渡す。
  */
 import { createServer, type Server } from 'http';
+import { audioApi } from './cli/audio-api.js';
 import { discordApi } from './cli/discord-api.js';
 import { scheduleCmd } from './cli/schedule-cmd.js';
 import { systemCmd } from './cli/system-cmd.js';
@@ -46,6 +47,8 @@ async function executeCommand(
 ): Promise<string> {
   if (command.startsWith('discord_') || command === 'media_send') {
     return discordApi(command, flags, context);
+  } else if (command.startsWith('audio_')) {
+    return audioApi(command, flags);
   } else if (command.startsWith('schedule_')) {
     return scheduleCmd(command, flags);
   } else if (command.startsWith('system_')) {

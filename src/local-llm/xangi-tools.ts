@@ -86,17 +86,22 @@ const discordSendHandler: ToolHandler = {
     properties: {
       channel: { type: 'string', description: 'チャンネルID' },
       message: { type: 'string', description: '送信するメッセージ' },
+      'reply-to-message-id': { type: 'string', description: '返信先メッセージID（任意）' },
     },
     required: ['channel', 'message'],
   },
   async execute(args): Promise<ToolResult> {
-    return runXangiCmd([
+    const cliArgs = [
       'discord_send',
       '--channel',
       String(args.channel),
       '--message',
       String(args.message),
-    ]);
+    ];
+    if (args['reply-to-message-id']) {
+      cliArgs.push('--reply-to-message-id', String(args['reply-to-message-id']));
+    }
+    return runXangiCmd(cliArgs);
   },
 };
 
@@ -282,6 +287,102 @@ const mediaSendHandler: ToolHandler = {
   },
 };
 
+// ─── Audio Tools ────────────────────────────────────────────────────
+
+const audioTranscribeHandler: ToolHandler = {
+  name: 'audio_transcribe',
+  description: 'ローカル音声ファイルを STT して文字起こしする。',
+  parameters: {
+    type: 'object',
+    properties: {
+      file: { type: 'string', description: '音声ファイルパス（workspace基準の相対パス可）' },
+      model: { type: 'string', description: 'STTモデル名（任意）' },
+      language: { type: 'string', description: '言語コード（例: ja, en）' },
+      prompt: { type: 'string', description: '補助プロンプト（任意）' },
+      'response-format': {
+        type: 'string',
+        description: '応答形式',
+        enum: ['json', 'text', 'verbose_json'],
+      },
+    },
+    required: ['file'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const flags: Record<string, string> = { file: String(args.file) };
+    if (args.model) flags.model = String(args.model);
+    if (args.language) flags.language = String(args.language);
+    if (args.prompt) flags.prompt = String(args.prompt);
+    if (args['response-format']) flags['response-format'] = String(args['response-format']);
+    return runXangiCmd(['audio_transcribe', ...flagsToArgs(flags)], {
+      XANGI_WORKSPACE_PATH: context.workspace,
+    });
+  },
+};
+
+const audioSpeechHandler: ToolHandler = {
+  name: 'audio_speech',
+  description: 'テキストから音声ファイルを生成し、MEDIAパス付きで返す。',
+  parameters: {
+    type: 'object',
+    properties: {
+      input: { type: 'string', description: '読み上げるテキスト' },
+      output: { type: 'string', description: '出力先ファイルパス（workspace基準の相対パス可）' },
+      model: { type: 'string', description: 'TTSモデル名（任意）' },
+      voice: { type: 'string', description: '音声名（任意）' },
+      format: { type: 'string', description: '出力形式', enum: ['wav', 'mp3'] },
+      speed: { type: 'string', description: '話速（例: 1.0）' },
+    },
+    required: ['input'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const flags: Record<string, string> = { input: String(args.input) };
+    if (args.output) flags.output = String(args.output);
+    if (args.model) flags.model = String(args.model);
+    if (args.voice) flags.voice = String(args.voice);
+    if (args.format) flags.format = String(args.format);
+    if (args.speed) flags.speed = String(args.speed);
+    return runXangiCmd(['audio_speech', ...flagsToArgs(flags)], {
+      XANGI_WORKSPACE_PATH: context.workspace,
+    });
+  },
+};
+
+const audioHealthHandler: ToolHandler = {
+  name: 'audio_health',
+  description: '音声 gateway / backend のヘルス状態を確認する。',
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+  async execute(): Promise<ToolResult> {
+    return runXangiCmd(['audio_health']);
+  },
+};
+
+const audioModelsHandler: ToolHandler = {
+  name: 'audio_models',
+  description: '利用可能な STT/TTS モデル一覧を取得する。',
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+  async execute(): Promise<ToolResult> {
+    return runXangiCmd(['audio_models']);
+  },
+};
+
+const audioBackendsHandler: ToolHandler = {
+  name: 'audio_backends',
+  description: '現在の音声 backend 構成を取得する。',
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+  async execute(): Promise<ToolResult> {
+    return runXangiCmd(['audio_backends']);
+  },
+};
+
 // ─── System Tools ───────────────────────────────────────────────────
 
 const systemRestartHandler: ToolHandler = {
@@ -341,7 +442,17 @@ export function getSystemTools(): ToolHandler[] {
   return [systemRestartHandler, systemSettingsHandler];
 }
 
+export function getAudioTools(): ToolHandler[] {
+  return [
+    audioTranscribeHandler,
+    audioSpeechHandler,
+    audioHealthHandler,
+    audioModelsHandler,
+    audioBackendsHandler,
+  ];
+}
+
 /** 全xangiツール（プラットフォーム問わず） */
 export function getAllXangiTools(): ToolHandler[] {
-  return [...getDiscordTools(), ...getScheduleTools(), ...getSystemTools()];
+  return [...getDiscordTools(), ...getScheduleTools(), ...getAudioTools(), ...getSystemTools()];
 }

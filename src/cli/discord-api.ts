@@ -61,6 +61,10 @@ interface DiscordCommandContext {
   channelId?: string;
 }
 
+interface DiscordSendOptions {
+  replyToMessageId?: string;
+}
+
 // ─── Commands ───────────────────────────────────────────────────────
 
 function resolveHistoryChannelId(
@@ -132,29 +136,56 @@ async function discordHistory(
   return `📺 チャンネル履歴（${offsetLabel}）:\n${lines.join('\n')}`;
 }
 
-async function discordSend(flags: Record<string, string>): Promise<string> {
-  const channelId = flags['channel'];
-  const message = flags['message'];
-  if (!channelId) throw new Error('--channel is required');
-  if (!message) throw new Error('--message is required');
+export async function sendDiscordMessage(
+  channelId: string,
+  message: string,
+  options?: DiscordSendOptions
+): Promise<{ messageIds: string[] }> {
+  if (!channelId) throw new Error('channelId is required');
+  if (!message) throw new Error('message is required');
 
-  // 2000文字制限に合わせて分割送信
   const chunks: string[] = [];
   for (let i = 0; i < message.length; i += MAX_MESSAGE_LENGTH) {
     chunks.push(message.slice(i, i + MAX_MESSAGE_LENGTH));
   }
 
+  const messageIds: string[] = [];
+  let replyTarget = options?.replyToMessageId;
+
   for (const chunk of chunks) {
-    await discordFetch(`/channels/${channelId}/messages`, {
+    const created = (await discordFetch(`/channels/${channelId}/messages`, {
       method: 'POST',
       body: JSON.stringify({
         content: chunk,
         allowed_mentions: { parse: [] },
+        ...(replyTarget
+          ? {
+              message_reference: {
+                message_id: replyTarget,
+                channel_id: channelId,
+              },
+            }
+          : {}),
       }),
-    });
+    })) as DiscordMessage;
+    messageIds.push(created.id);
+    // 2個目以降のチャンクは最初の返信チェーンにぶら下げない
+    replyTarget = undefined;
   }
 
-  return `✅ メッセージを送信しました (${chunks.length} chunk(s))`;
+  return { messageIds };
+}
+
+async function discordSend(flags: Record<string, string>): Promise<string> {
+  const channelId = flags['channel'];
+  const message = flags['message'];
+  if (!channelId) throw new Error('--channel is required');
+  if (!message) throw new Error('--message is required');
+  const replyToMessageId = flags['reply-to-message-id'];
+  const { messageIds } = await sendDiscordMessage(channelId, message, {
+    replyToMessageId,
+  });
+  return `✅ メッセージを送信しました (${messageIds.length} chunk(s))`;
 }
 
 async function discordChannels(flags: Record<string, string>): Promise<string> {
