@@ -43,6 +43,8 @@ class BackendConfig(BaseModel):
 STT_BACKEND = os.getenv("STT_BACKEND", "llama_cpp").strip().lower()
 TIMEOUT_SECONDS = float(os.getenv("AUDIO_PROXY_TIMEOUT_SECONDS", "300"))
 RETRY_COUNT = max(1, int(os.getenv("AUDIO_PROXY_RETRIES", "2")))
+STT_FORCE_LANGUAGE = os.getenv("STT_FORCE_LANGUAGE", "").strip()
+STT_DEFAULT_TEMPERATURE = os.getenv("STT_DEFAULT_TEMPERATURE", "0").strip()
 
 STT_BACKENDS: dict[str, BackendConfig] = {
     "llama_cpp": BackendConfig(
@@ -180,12 +182,20 @@ async def transcribe(
     content = await file.read()
     form_data: dict[str, Any] = {}
 
+    effective_language = language
+    effective_temperature = temperature
+    if ACTIVE_STT_BACKEND.name == "llama_cpp":
+        if STT_FORCE_LANGUAGE:
+            effective_language = STT_FORCE_LANGUAGE
+        if effective_temperature in (None, "") and STT_DEFAULT_TEMPERATURE:
+            effective_temperature = STT_DEFAULT_TEMPERATURE
+
     for key, value in {
         "model": model,
-        "language": language,
+        "language": effective_language,
         "prompt": prompt,
         "response_format": response_format,
-        "temperature": temperature,
+        "temperature": effective_temperature,
     }.items():
         if value not in (None, ""):
             form_data[key] = value

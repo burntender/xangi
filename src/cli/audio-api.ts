@@ -91,12 +91,12 @@ async function audioTranscribe(flags: Record<string, string>): Promise<string> {
 
   for (const [flagKey, formKey] of [
     ['model', 'model'],
-    ['language', 'language'],
     ['prompt', 'prompt'],
-    ['temperature', 'temperature'],
   ] as const) {
     if (flags[flagKey]) form.append(formKey, flags[flagKey]);
   }
+  form.append('language', process.env.STT_FORCE_LANGUAGE || flags['language'] || 'ja');
+  form.append('temperature', flags['temperature'] || process.env.STT_DEFAULT_TEMPERATURE || '0');
   // llama.cpp transcription currently accepts json only, so normalize here and post-process.
   form.append('response_format', 'json');
 
@@ -127,7 +127,7 @@ async function audioSpeech(flags: Record<string, string>): Promise<string> {
     input,
     voice: flags['voice'] || 'alloy',
     response_format: flags['format'] || 'wav',
-    speed: Number(flags['speed'] || '1.0'),
+    speed: Number(flags['speed'] || process.env.XANGI_AUDIO_TTS_SPEED || '0.9'),
   };
 
   const res = await audioFetch('/v1/audio/speech', {

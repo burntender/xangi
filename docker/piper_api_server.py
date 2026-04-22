@@ -13,6 +13,7 @@ import uvicorn
 import asyncio
 
 app = FastAPI(title="Piper TTS API")
+DEFAULT_SPEED = float(os.getenv("XANGI_AUDIO_TTS_SPEED", "0.9"))
 
 class TTSRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -22,13 +23,20 @@ class TTSRequest(BaseModel):
     speaker_id: int = 0
     output_format: str = Field(default="wav", alias="response_format")  # wav or mp3
     voice: str | None = None
-    speed: float = 1.0
+    speed: float = DEFAULT_SPEED
 
 # モデルパス設定
 MODEL_BASE_PATH = Path("/app/models")
 DEFAULT_MODEL = "tsukuyomi-chan-6lang-fp16.onnx"
 DEFAULT_CONFIG = "config.json"
 OPENAI_MODEL_ALIASES = {"tts-1", "tts-1-hd"}
+
+
+def _speed_to_length_scale(speed: float) -> float:
+    # Piper controls speech rate through phoneme length.
+    # Lower requested speed should make utterances longer.
+    bounded_speed = min(max(speed, 0.25), 2.0)
+    return 1.0 / bounded_speed
 
 
 @app.get("/health")
@@ -89,6 +97,7 @@ async def create_speech(request: TTSRequest):
             "--config", str(config_path),
             "--output_file", output_path,
             "--speaker", str(request.speaker_id),
+            "--length_scale", str(_speed_to_length_scale(request.speed)),
         ]
         
         # テキストを標準入力から渡す

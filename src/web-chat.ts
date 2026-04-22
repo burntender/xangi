@@ -13,9 +13,12 @@ import {
   statSync,
   mkdirSync,
   unlinkSync,
+  mkdtempSync,
+  rmSync,
 } from 'fs';
 import { join, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
 import type { AgentRunner } from './agent-runner.js';
 import { sendDiscordMessage } from './cli/discord-api.js';
 import {
@@ -48,6 +51,16 @@ const AUDIO_CHAT_SYSTEM_PROMPT = [
   '自然に読み上げやすい短めの日本語で返答してください。',
   '一文ごとに簡潔にし、返答全体は長くなりすぎないようにしてください。',
 ].join('\n');
+const STT_TRANSCRIPTION_PROMPT = [
+  'これは日本語の音声文字起こしです。',
+  '聞こえた音声だけを、そのまま自然な日本語として書き起こしてください。',
+  '要約、補完、感想、繰り返し、言い換えはしないでください。',
+  '聞き取れない部分は無理に補わず、短く不明として扱ってください。',
+].join('\n');
+const DEFAULT_STT_CHUNK_SECONDS = 20;
+const DEFAULT_STT_SPLIT_THRESHOLD_SECONDS = 25;
+const STT_REPETITION_ERROR =
+  'STT output was rejected because it appears to be trapped in a repeated phrase loop.';
 
 // resume後の最初のメッセージにセッション履歴を注入するためのフラグ
 let resumedAppSessionId: string | null = null;
@@ -138,7 +151,7 @@ async function parseMultipart(
 
 async function callAudioTranscription(
   audioPath: string,
-  options?: { language?: string }
+  options?: { language?: string; prompt?: string }
 ): Promise<string> {
   const form = new FormData();
   const buffer = readFileSync(audioPath);
@@ -150,7 +163,9 @@ async function callAudioTranscription(
     extname(audioPath) ? audioPath.split('/').pop() || 'audio.wav' : 'audio.wav'
   );
   form.append('response_format', 'json');
-  if (options?.language) form.append('language', options.language);
+  form.append('language', process.env.STT_FORCE_LANGUAGE || options?.language || 'ja');
+  if (options?.prompt) form.append('prompt', options.prompt);
+  form.append('temperature', process.env.STT_DEFAULT_TEMPERATURE || '0');
 
   const baseUrl = (process.env.XANGI_AUDIO_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
   const res = await fetch(`${baseUrl}/v1/audio/transcriptions`, { method: 'POST', body: form });
@@ -161,9 +176,160 @@ async function callAudioTranscription(
   return payload.text || JSON.stringify(payload);
 }
 
+function normalizeTranscriptLine(value: string): string {
+  return value
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .replace(/[。．.!！?？]+$/g, '')
+    .trim();
+}
+
+function detectRepeatedPhraseLoop(text: string): boolean {
+  const normalized = normalizeTranscriptLine(text);
+  if (!normalized) return false;
+
+  const lines = text
+    .split(/\r?\n+/)
+    .map(normalizeTranscriptLine)
+    .filter(Boolean);
+
+  if (lines.length >= 3 && new Set(lines).size === 1) {
+    return true;
+  }
+
+  const sentences = normalized
+    .split(/[。．.!！?？\n]+/)
+    .map(normalizeTranscriptLine)
+    .filter(Boolean);
+
+  if (sentences.length >= 4 && new Set(sentences).size === 1) {
+    return true;
+  }
+
+  const phrase = sentences[0] || normalized;
+  if (phrase.length < 4) return false;
+
+  let repeatCount = 0;
+  let cursor = normalized;
+  while (cursor.startsWith(phrase)) {
+    repeatCount += 1;
+    cursor = cursor.slice(phrase.length).trimStart();
+    if (repeatCount >= 3) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function getAudioDurationSeconds(audioPath: string): number | null {
+  try {
+    const output = execFileSync(
+      'ffprobe',
+      [
+        '-v',
+        'error',
+        '-show_entries',
+        'format=duration',
+        '-of',
+        'default=noprint_wrappers=1:nokey=1',
+        audioPath,
+      ],
+      { encoding: 'utf-8' }
+    ).trim();
+    const duration = Number(output);
+    return Number.isFinite(duration) ? duration : null;
+  } catch {
+    return null;
+  }
+}
+
+function prepareAudioChunks(audioPath: string): {
+  chunkPaths: string[];
+  cleanupDir: string | null;
+} {
+  const duration = getAudioDurationSeconds(audioPath);
+  const chunkSeconds = Number(process.env.STT_CHUNK_SECONDS || DEFAULT_STT_CHUNK_SECONDS);
+  const splitThreshold = Number(
+    process.env.STT_SPLIT_THRESHOLD_SECONDS || DEFAULT_STT_SPLIT_THRESHOLD_SECONDS
+  );
+
+  if (!duration || duration <= splitThreshold) {
+    return { chunkPaths: [audioPath], cleanupDir: null };
+  }
+
+  const chunkDir = mkdtempSync(join(dirname(audioPath), 'stt-chunks-'));
+  const chunkPattern = join(chunkDir, 'chunk-%03d.wav');
+  execFileSync('ffmpeg', [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    audioPath,
+    '-vn',
+    '-ac',
+    '1',
+    '-ar',
+    '16000',
+    '-f',
+    'segment',
+    '-segment_time',
+    String(chunkSeconds),
+    chunkPattern,
+  ]);
+
+  const chunkPaths = readdirSync(chunkDir)
+    .filter((name) => name.endsWith('.wav'))
+    .sort()
+    .map((name) => join(chunkDir, name));
+
+  if (chunkPaths.length === 0) {
+    rmSync(chunkDir, { recursive: true, force: true });
+    throw new Error('STT audio chunking failed: no chunks created');
+  }
+
+  return { chunkPaths, cleanupDir: chunkDir };
+}
+
+async function transcribeAudioWithChunking(
+  audioPath: string,
+  options?: { language?: string }
+): Promise<string> {
+  const { chunkPaths, cleanupDir } = prepareAudioChunks(audioPath);
+
+  try {
+    const transcriptParts: string[] = [];
+    for (const chunkPath of chunkPaths) {
+      const text = (
+        await callAudioTranscription(chunkPath, {
+          language: options?.language,
+          prompt: STT_TRANSCRIPTION_PROMPT,
+        })
+      ).trim();
+      if (!text) continue;
+      if (detectRepeatedPhraseLoop(text)) {
+        throw new Error(STT_REPETITION_ERROR);
+      }
+      if (transcriptParts[transcriptParts.length - 1] === text) continue;
+      transcriptParts.push(text);
+    }
+
+    const merged = transcriptParts.join('\n').trim();
+    if (detectRepeatedPhraseLoop(merged)) {
+      throw new Error(STT_REPETITION_ERROR);
+    }
+    return merged;
+  } finally {
+    if (cleanupDir) {
+      rmSync(cleanupDir, { recursive: true, force: true });
+    }
+  }
+}
+
 async function callAudioSpeech(text: string): Promise<{ buffer: Buffer; contentType: string }> {
   const baseUrl = (process.env.XANGI_AUDIO_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
   const ttsModel = process.env.XANGI_AUDIO_TTS_MODEL || 'tsukuyomi-chan-6lang-fp16';
+  const ttsSpeed = Number(process.env.XANGI_AUDIO_TTS_SPEED || '0.9');
   const res = await fetch(`${baseUrl}/v1/audio/speech`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -171,6 +337,7 @@ async function callAudioSpeech(text: string): Promise<{ buffer: Buffer; contentT
       model: ttsModel,
       input: text,
       response_format: 'wav',
+      speed: ttsSpeed,
     }),
   });
   if (!res.ok) {
@@ -429,7 +596,7 @@ export function startWebChat(options: WebChatOptions): void {
         }
 
         const language = fields.language || 'ja';
-        const transcript = await callAudioTranscription(audioFile.path, { language });
+        const transcript = await transcribeAudioWithChunking(audioFile.path, { language });
         const transcriptSend = await sendDiscordMessage(channelId, transcript);
         const transcriptMessageId = transcriptSend.messageIds[0];
 

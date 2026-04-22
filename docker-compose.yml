@@ -80,7 +80,7 @@ services:
       dockerfile: docker/Dockerfile.custom
     container_name: xangi-audio-gateway
     depends_on:
-      - stt-llama-cpp
+      - stt-transformers
       - piper-plus
     ports:
       - "8000:8000"  # 統一 STT/TTS API エンドポイント
@@ -94,11 +94,13 @@ services:
     volumes:
       - ./docker/audio_gateway.py:/app/audio_gateway.py:ro
     environment:
-      - STT_BACKEND=${STT_BACKEND:-llama_cpp}
+      - STT_BACKEND=${STT_BACKEND:-transformers}
       - STT_BASE_URL=${STT_BASE_URL:-http://stt-llama-cpp:8080}
       - STT_REQUEST_PATH=${STT_REQUEST_PATH:-/v1/audio/transcriptions}
       - STT_HEALTH_PATH=${STT_HEALTH_PATH:-/health}
       - STT_MODELS_PATH=${STT_MODELS_PATH:-/v1/models}
+      - STT_FORCE_LANGUAGE=${STT_FORCE_LANGUAGE:-ja}
+      - STT_DEFAULT_TEMPERATURE=${STT_DEFAULT_TEMPERATURE:-0}
       - TRANSFORMERS_STT_BASE_URL=${TRANSFORMERS_STT_BASE_URL:-http://stt-transformers:8001}
       - VLLM_STT_BASE_URL=${VLLM_STT_BASE_URL:-http://stt-vllm:8001}
       - TTS_BASE_URL=${TTS_BASE_URL:-http://piper-plus:8000}
@@ -134,26 +136,35 @@ services:
               count: all
               capabilities: [gpu]
     command: >-
-      ${STT_LLAMA_SERVER_ARGS:---model /models/qwen3-asr/Qwen3-ASR-1.7B-Q8_0.gguf --mmproj /models/qwen3-asr/mmproj-Qwen3-ASR-1.7B-bf16.gguf --host 0.0.0.0 --port 8080 --jinja -ngl 999 -c 8192}
+      ${STT_LLAMA_SERVER_ARGS:---model /models/qwen3-asr/Qwen3-ASR-1.7B-Q8_0.gguf --mmproj /models/qwen3-asr/mmproj-Qwen3-ASR-1.7B-bf16.gguf --host 0.0.0.0 --port 8080 --jinja -ngl 999 -c 8192 -n 256}
 
   # Optional fallback backends.
   # Use these only when llama.cpp backend validation fails for a target workload.
-  # stt-transformers:
-  #   profiles: ["stt-fallback"]
-  #   image: xangi:custom
-  #   container_name: stt-transformers
-  #   restart: unless-stopped
-  #   command: >
-  #     /opt/gpu-env/.venv/bin/python
-  #     /app/stt_transformers_server.py
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #
+  stt-transformers:
+    image: xangi:custom
+    container_name: stt-transformers
+    restart: unless-stopped
+    volumes:
+      - ./docker/stt_transformers_server.py:/app/stt_transformers_server.py:ro
+      - ../../models/STT:/models:ro
+    environment:
+      - TRANSFORMERS_STT_MODEL_PATH=${TRANSFORMERS_STT_MODEL_PATH:-/models/qwen3-asr/qwen3-asr}
+      - TRANSFORMERS_STT_MODEL_ID=${TRANSFORMERS_STT_MODEL_ID:-Qwen3-ASR-1.7B}
+      - TRANSFORMERS_STT_DEVICE_MAP=${TRANSFORMERS_STT_DEVICE_MAP:-cuda:0}
+      - TRANSFORMERS_STT_MAX_NEW_TOKENS=${TRANSFORMERS_STT_MAX_NEW_TOKENS:-256}
+      - TRANSFORMERS_STT_MAX_BATCH_SIZE=${TRANSFORMERS_STT_MAX_BATCH_SIZE:-8}
+      - TRANSFORMERS_STT_ATTN_IMPLEMENTATION=${TRANSFORMERS_STT_ATTN_IMPLEMENTATION:-}
+    command: >
+      /opt/gpu-env/.venv/bin/python
+      /app/stt_transformers_server.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   # stt-vllm:
   #   profiles: ["stt-experimental"]
   #   image: vllm/vllm-openai:latest

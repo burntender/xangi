@@ -49,7 +49,7 @@ RUN npm ci --omit=dev --ignore-scripts
 COPY --from=builder /app/dist ./dist
 
 # Install Codex CLI globally (as root)
-RUN npm install -g @openai/codex
+# RUN npm install -g @openai/codex
 
 # Use existing ubuntu user (UID 1000, matches host user for volume permissions)
 RUN mkdir -p /home/ubuntu/.config/gh /home/ubuntu/.local/bin /home/ubuntu/.local/share/uv \
@@ -59,7 +59,7 @@ RUN mkdir -p /home/ubuntu/.config/gh /home/ubuntu/.local/bin /home/ubuntu/.local
 USER ubuntu
 
 # Install Claude Code CLI
-RUN curl -fsSL https://claude.ai/install.sh | bash
+# RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Install CLI tools via uv tool
 RUN uv tool install yt-dlp && \

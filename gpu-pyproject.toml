@@ -8,6 +8,7 @@ dependencies = [
     "torchvision",
     "diffusers",
     "transformers",
+    "qwen-asr",
     "accelerate",
     "pillow",
     "fastapi>=0.115.0",
