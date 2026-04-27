@@ -79,11 +79,10 @@ services:
       context: .
       dockerfile: docker/Dockerfile.custom
     container_name: xangi-audio-gateway
-    depends_on:
-      - stt-transformers
-      - piper-plus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "8000:8000"  # 統一 STT/TTS API エンドポイント
+      - "8000:8000"  # 統一 STT/TTS API エンドポイント（xangi 専用）
     deploy:
       resources:
         reservations:
@@ -95,15 +94,15 @@ services:
       - ./docker/audio_gateway.py:/app/audio_gateway.py:ro
     environment:
       - STT_BACKEND=${STT_BACKEND:-transformers}
-      - STT_BASE_URL=${STT_BASE_URL:-http://stt-llama-cpp:8080}
+      - STT_BASE_URL=${STT_BASE_URL:-http://host.docker.internal:18081}
       - STT_REQUEST_PATH=${STT_REQUEST_PATH:-/v1/audio/transcriptions}
       - STT_HEALTH_PATH=${STT_HEALTH_PATH:-/health}
       - STT_MODELS_PATH=${STT_MODELS_PATH:-/v1/models}
       - STT_FORCE_LANGUAGE=${STT_FORCE_LANGUAGE:-ja}
       - STT_DEFAULT_TEMPERATURE=${STT_DEFAULT_TEMPERATURE:-0}
-      - TRANSFORMERS_STT_BASE_URL=${TRANSFORMERS_STT_BASE_URL:-http://stt-transformers:8001}
-      - VLLM_STT_BASE_URL=${VLLM_STT_BASE_URL:-http://stt-vllm:8001}
-      - TTS_BASE_URL=${TTS_BASE_URL:-http://piper-plus:8000}
+      - TRANSFORMERS_STT_BASE_URL=${TRANSFORMERS_STT_BASE_URL:-http://host.docker.internal:18081}
+      - VLLM_STT_BASE_URL=${VLLM_STT_BASE_URL:-http://host.docker.internal:8001}
+      - TTS_BASE_URL=${TTS_BASE_URL:-http://host.docker.internal:18082}
       - TTS_HEALTH_PATH=${TTS_HEALTH_PATH:-/health}
       - TTS_MODELS_PATH=${TTS_MODELS_PATH:-/v1/models}
       - AUDIO_PROXY_TIMEOUT_SECONDS=${AUDIO_PROXY_TIMEOUT_SECONDS:-300}
@@ -111,95 +110,6 @@ services:
     command: >
       /opt/gpu-env/.venv/bin/python
       /app/audio_gateway.py
-
-  # CUDA ベースイメージ (共通)
-  xangi-cuda-base:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.cuda-base
-    image: kazi1024/xangi-cuda-base:latest
-
-  # llama.cpp STT (Qwen3-ASR GGUF, GPU 付き)
-  stt-llama-cpp:
-    image: ${STT_LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
-    container_name: stt-llama-cpp
-    restart: unless-stopped
-    volumes:
-      - ../../models/STT:/models:ro
-    ports:
-      - "8001:8080"  # STT API エンドポイント
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: >-
-      ${STT_LLAMA_SERVER_ARGS:---model /models/qwen3-asr/Qwen3-ASR-1.7B-Q8_0.gguf --mmproj /models/qwen3-asr/mmproj-Qwen3-ASR-1.7B-bf16.gguf --host 0.0.0.0 --port 8080 --jinja -ngl 999 -c 8192 -n 256}
-
-  # Optional fallback backends.
-  # Use these only when llama.cpp backend validation fails for a target workload.
-  stt-transformers:
-    image: xangi:custom
-    container_name: stt-transformers
-    restart: unless-stopped
-    volumes:
-      - ./docker/stt_transformers_server.py:/app/stt_transformers_server.py:ro
-      - ../../models/STT:/models:ro
-    environment:
-      - TRANSFORMERS_STT_MODEL_PATH=${TRANSFORMERS_STT_MODEL_PATH:-/models/qwen3-asr/qwen3-asr}
-      - TRANSFORMERS_STT_MODEL_ID=${TRANSFORMERS_STT_MODEL_ID:-Qwen3-ASR-1.7B}
-      - TRANSFORMERS_STT_DEVICE_MAP=${TRANSFORMERS_STT_DEVICE_MAP:-cuda:0}
-      - TRANSFORMERS_STT_MAX_NEW_TOKENS=${TRANSFORMERS_STT_MAX_NEW_TOKENS:-256}
-      - TRANSFORMERS_STT_MAX_BATCH_SIZE=${TRANSFORMERS_STT_MAX_BATCH_SIZE:-8}
-      - TRANSFORMERS_STT_ATTN_IMPLEMENTATION=${TRANSFORMERS_STT_ATTN_IMPLEMENTATION:-}
-    command: >
-      /opt/gpu-env/.venv/bin/python
-      /app/stt_transformers_server.py
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  # stt-vllm:
-  #   profiles: ["stt-experimental"]
-  #   image: vllm/vllm-openai:latest
-  #   container_name: stt-vllm
-  #   restart: unless-stopped
-
-  # piper-plus (音声合成、GPU 付き、CUDA 13.1.1)
-  piper-plus:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.piper-plus
-    container_name: piper-plus
-    restart: unless-stopped
-    depends_on:
-      - xangi-cuda-base
-    volumes:
-      - ./piper_data:/data
-      - ../../models/TTS/tsukuyomi-chan-6lang-fp16.onnx:/app/models/tsukuyomi-chan-6lang-fp16.onnx:ro
-      - ../models/tts/config.json:/app/models/config.json:ro
-      - ./piper_output:/app/output
-    ports:
-      - "8766:8000"  # OpenAI 互換 API エンドポイント
-      # - "7860:7860"  # WebUI（必要な場合のみ有効化）
-    environment:
-      - PIPER_MODEL_PATH=${PIPER_MODEL_PATH:-./app/models/tsukuyomi-chan-6lang-fp16.onnx}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: >
-      /opt/common-venv/bin/python
-      /app/piper_api_server.py
 
 volumes:
   claude-data:

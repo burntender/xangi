@@ -1,0 +1,61 @@
+# Audio Services (STT + TTS) - 独立運用用
+# docker compose -f docker/audio-services/docker-compose.yml up --build
+#
+# 外部から OpenAI 互換 API として利用可能:
+#   STT: POST http://localhost:18081/v1/audio/transcriptions
+#   TTS: POST http://localhost:18082/v1/audio/speech
+
+services:
+  # STT (transformers backend, Qwen3-ASR)
+  stt:
+    build:
+      context: ../..
+      dockerfile: docker/audio-services/Dockerfile.stt
+    image: xangi-stt:latest
+    container_name: stt
+    restart: unless-stopped
+    volumes:
+      - ../../../../models/STT:/models:ro
+    ports:
+      - "${STT_PORT:-18081}:8001"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - TRANSFORMERS_STT_MODEL_PATH=${TRANSFORMERS_STT_MODEL_PATH:-/models/qwen3-asr/qwen3-asr}
+      - TRANSFORMERS_STT_MODEL_ID=${TRANSFORMERS_STT_MODEL_ID:-Qwen3-ASR-1.7B}
+      - TRANSFORMERS_STT_DEVICE_MAP=${TRANSFORMERS_STT_DEVICE_MAP:-cuda:0}
+      - TRANSFORMERS_STT_MAX_NEW_TOKENS=${TRANSFORMERS_STT_MAX_NEW_TOKENS:-256}
+      - TRANSFORMERS_STT_MAX_BATCH_SIZE=${TRANSFORMERS_STT_MAX_BATCH_SIZE:-8}
+      - TRANSFORMERS_STT_ATTN_IMPLEMENTATION=${TRANSFORMERS_STT_ATTN_IMPLEMENTATION:-}
+
+  # TTS (piper-plus)
+  tts:
+    build:
+      context: ../..
+      dockerfile: docker/audio-services/Dockerfile.tts
+    image: xangi-tts:latest
+    container_name: tts
+    restart: unless-stopped
+    volumes:
+      - ../../piper_data:/data
+      - ../../../../models/TTS/tsukuyomi-chan-6lang-fp16.onnx:/app/models/tsukuyomi-chan-6lang-fp16.onnx:ro
+      - ${PIPER_CONFIG_HOST_PATH:-../../../../models/TTS/config.json}:/app/models/config.json:ro
+      - ../../piper_output:/app/output
+    ports:
+      - "${TTS_PORT:-18082}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - PIPER_MODEL_PATH=${PIPER_MODEL_PATH:-/app/models/tsukuyomi-chan-6lang-fp16.onnx}
+      - PIPER_CONFIG_PATH=${PIPER_CONFIG_PATH:-/app/models/config.json}
+      - XANGI_AUDIO_TTS_SPEED=${XANGI_AUDIO_TTS_SPEED:-0.9}

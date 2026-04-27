@@ -1,0 +1,40 @@
+# STT (transformers backend) independent container
+FROM nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
+
+# 基本パッケージ
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    python3 \
+    python3-pip \
+    python3.12-venv \
+    ffmpeg \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+# Install uv binary
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Install PyTorch (CUDA) + STT dependencies via uv
+# Uses the same gpu-pyproject.toml that xangi-custom uses
+COPY gpu-pyproject.toml /opt/gpu-env/pyproject.toml
+RUN cd /opt/gpu-env && uv sync --frozen --no-dev 2>/dev/null \
+    || cd /opt/gpu-env && uv sync --no-dev
+
+# Copy STT server script
+COPY docker/audio-services/stt_transformers_server.py .
+
+# Add GPU venv to PATH (matches the server's shebang)
+ENV PATH="/opt/gpu-env/.venv/bin:${PATH}"
+
+EXPOSE 8001
+
+CMD ["/opt/gpu-env/.venv/bin/python", "stt_transformers_server.py"]
