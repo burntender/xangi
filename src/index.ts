@@ -30,6 +30,7 @@ import {
 } from './file-utils.js';
 import { initSettings, loadSettings, saveSettings, formatSettings } from './settings.js';
 import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH } from './constants.js';
+import { readFileSync, writeFileSync } from 'fs';
 import {
   Scheduler,
   parseScheduleInput,
@@ -51,6 +52,8 @@ import { join } from 'path';
 import { config as dotenvConfig } from 'dotenv';
 import { startWebChat } from './web-chat.js';
 dotenvConfig({ override: true });
+
+const lastSentMessageIds = new Map<string, string>();
 
 /** メッセージを指定文字数で分割（カスタムセパレータ対応、デフォルトは行単位） */
 function splitMessage(text: string, maxLength: number, separator: string = '\n'): string[] {
@@ -108,9 +111,6 @@ function getTypeLabel(
   }
 }
 
-// チャンネルごとの最後に送信したボットメッセージID
-const lastSentMessageIds = new Map<string, string>();
-
 /** 処理中に表示するStopボタン */
 function createStopButton(): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -131,13 +131,21 @@ function createCompletedButtons(): ActionRowBuilder<ButtonBuilder> {
 function formatToolInput(toolName: string, input: Record<string, unknown>): string {
   switch (toolName) {
     case 'Read':
-      return input.file_path ? `: ${String(input.file_path).split('/').slice(-2).join('/')}` : '';
+    case 'read':
+      return input.file_path || input.path
+        ? `: ${String(input.file_path || input.path)
+            .split('/')
+            .slice(-2)
+            .join('/')}`
+        : '';
     case 'Edit':
     case 'Write':
       return input.file_path ? `: ${String(input.file_path).split('/').slice(-2).join('/')}` : '';
-    case 'Bash': {
-      if (!input.command) return '';
-      const cmd = String(input.command);
+    case 'Bash':
+    case 'exec': {
+      const cmdKey = input.command || input.cmd;
+      if (!cmdKey) return '';
+      const cmd = String(cmdKey);
       const cmdDisplay = `: \`${cmd.slice(0, 60)}${cmd.length > 60 ? '...' : ''}\``;
       const ghBadge = cmd.startsWith('gh ') && isGitHubAppEnabled() ? ' 🔑App' : '';
       return cmdDisplay + ghBadge;
@@ -147,6 +155,7 @@ function formatToolInput(toolName: string, input: Record<string, unknown>): stri
     case 'Grep':
       return input.pattern ? `: ${String(input.pattern)}` : '';
     case 'WebFetch':
+    case 'web_fetch':
       return input.url ? `: ${String(input.url).slice(0, 60)}` : '';
     case 'Agent':
       return input.description ? `: ${String(input.description)}` : '';
@@ -227,12 +236,15 @@ async function main() {
   // セッション永続化を初期化
   initSessions(dataDir);
 
+  // チャンネルごとの実行状態を追跡
+  const processingChannels = new Set<string>();
+
   // WebチャットUI起動
   if (process.env.WEB_CHAT_ENABLED === 'true' || process.env.AUDIO_CHAT_API_ENABLED === 'true') {
     startWebChat({ agentRunner });
   }
 
-  // GitHub認証を初期化
+  // GitHub認証を初期化（秘密鍵をメモリに読み込む）
   const { initGitHubAuth } = await import('./github-auth.js');
   initGitHubAuth();
 
@@ -338,6 +350,16 @@ async function main() {
       )
       .toJSON(),
   ];
+
+  // ALLOW_AUTOREPLY_COMMAND=true の場合のみコマンドを登録
+  if (config.discord.allowAutoreplyCommand) {
+    commands.push(
+      new SlashCommandBuilder()
+        .setName('autoreply')
+        .setDescription('このチャンネルのメンションなし応答を切り替え')
+        .toJSON()
+    );
+  }
 
   // 各スキルを個別のスラッシュコマンドとして追加
   for (const skill of skills) {
@@ -763,12 +785,6 @@ async function main() {
 
         // SYSTEM_COMMAND処理
         handleSettingsFromResponse(runResult.result);
-
-        // !discord コマンド処理
-        if (interaction.channel) {
-          const fakeMessage = { channel: interaction.channel } as Message;
-          await handleDiscordCommandsInResponse(runResult.result, fakeMessage);
-        }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         let errorDetail: string;
@@ -783,6 +799,44 @@ async function main() {
         }
         await interaction.editReply(errorDetail).catch(() => {});
       }
+      return;
+    }
+
+    if (interaction.commandName === 'autoreply') {
+      if (!config.discord.allowAutoreplyCommand) {
+        await interaction.reply({ content: 'このコマンドは無効です', ephemeral: true });
+        return;
+      }
+      const chId = interaction.channelId;
+      const channels = config.discord.autoReplyChannels ?? [];
+      const idx = channels.indexOf(chId);
+      const isCurrentlyOn = idx !== -1;
+
+      if (isCurrentlyOn) {
+        // OFF: メモリから削除
+        channels.splice(idx, 1);
+      } else {
+        // ON: メモリに追加
+        channels.push(chId);
+      }
+      config.discord.autoReplyChannels = channels;
+
+      // .env に永続化
+      try {
+        const envPath = join(process.cwd(), '.env');
+        const envContent = readFileSync(envPath, 'utf-8');
+        const newValue = channels.join(',');
+        const updated = envContent.replace(
+          /^AUTO_REPLY_CHANNELS=.*$/m,
+          `AUTO_REPLY_CHANNELS=${newValue}`
+        );
+        writeFileSync(envPath, updated, 'utf-8');
+      } catch (e) {
+        console.error('[xangi] Failed to persist AUTO_REPLY_CHANNELS to .env:', e);
+      }
+
+      const status = isCurrentlyOn ? '❌ OFF' : '✅ ON';
+      await interaction.reply(`メンションなし応答: ${status} (<#${chId}>)`);
       return;
     }
 
@@ -993,16 +1047,19 @@ async function main() {
             send: (options: {
               content: string;
               allowedMentions: { parse: Array<'users'>; repliedUser: false };
-            }) => Promise<unknown>;
+            }) => Promise<{ id?: string }>;
           };
           // 2000文字制限に合わせて分割送信
           const chunks = chunkDiscordMessage(content);
           for (const chunk of chunks) {
-            await typedChannel.send({
+            const sentMessage = await typedChannel.send({
               content: chunk,
               // ユーザーメンションだけ有効化する。@everyone やロールメンションは許可しない。
               allowedMentions: { parse: ['users'], repliedUser: false },
             });
+            if (sentMessage.id) {
+              lastSentMessageIds.set(channelId, sentMessage.id);
+            }
           }
           const channelName = 'name' in channel ? channel.name : 'unknown';
           console.log(`[xangi] Sent message to #${channelName} (${chunks.length} chunk(s))`);
@@ -1299,6 +1356,9 @@ async function main() {
           }
           await msg.edit(newContent);
           const editedChannelId = targetChannelId || sourceMessage?.channel.id || fallbackChannelId;
+          if (editedChannelId) {
+            lastSentMessageIds.set(editedChannelId, msg.id);
+          }
           console.log(`[xangi] Edited message ${messageId} in channel ${editedChannelId}`);
           return { handled: true, feedback: true, response: '✏️ メッセージを編集しました' };
         }
@@ -1521,6 +1581,92 @@ async function main() {
     return feedbackResults;
   }
 
+  async function executeScheduleFromResponse(
+    text: string,
+    sourceMessage: Message,
+    scheduler: Scheduler,
+    schedulerConfig?: { enabled: boolean; startupEnabled: boolean }
+  ): Promise<void> {
+    const trimmed = text.trim();
+    const args = trimmed.replace(/^!schedule\s*/, '');
+
+    if (!args) {
+      const schedules = scheduler.list();
+      const content = formatScheduleList(schedules, schedulerConfig);
+      const chunks =
+        content.length <= DISCORD_MAX_LENGTH
+          ? [content.replaceAll(SCHEDULE_SEPARATOR, '')]
+          : splitScheduleContent(content, DISCORD_SAFE_LENGTH);
+
+      for (let i = 0; i < chunks.length; i++) {
+        if (i === 0) {
+          await sourceMessage.reply(chunks[i]);
+        } else if ('send' in sourceMessage.channel) {
+          await sourceMessage.channel.send(chunks[i]);
+        }
+      }
+      return;
+    }
+
+    if (args.startsWith('remove ')) {
+      const id = args.replace(/^remove\s+/, '').trim();
+      const removed = scheduler.remove(id);
+      await sourceMessage.reply(
+        removed ? `🗑️ スケジュール \`${id}\` を削除しました` : `❌ ID \`${id}\` が見つかりません`
+      );
+      return;
+    }
+
+    if (args.startsWith('toggle ')) {
+      const id = args.replace(/^toggle\s+/, '').trim();
+      const schedule = scheduler.toggle(id);
+      if (schedule) {
+        const status = schedule.enabled ? '✅ 有効' : '⏸️ 無効';
+        await sourceMessage.reply(`${status} に切り替えました: \`${id}\``);
+      } else {
+        await sourceMessage.reply(`❌ ID \`${id}\` が見つかりません`);
+      }
+      return;
+    }
+
+    const parsed = parseScheduleInput(args);
+    if (!parsed) {
+      await sourceMessage.reply(
+        '❌ 入力を解析できませんでした\n\n' +
+          '**対応フォーマット:**\n' +
+          '• `30分後 メッセージ` — 相対時間\n' +
+          '• `15:00 メッセージ` — 時刻指定\n' +
+          '• `毎日 9:00 メッセージ` — 毎日定時\n' +
+          '• `毎週月曜 10:00 メッセージ` — 週次\n' +
+          '• `cron 0 9 * * * メッセージ` — cron式'
+      );
+      return;
+    }
+
+    try {
+      const targetChannel = parsed.targetChannelId || sourceMessage.channel.id;
+      const schedule = scheduler.add({
+        ...parsed,
+        channelId: targetChannel,
+        platform: 'discord' as Platform,
+      });
+
+      const channelInfo = parsed.targetChannelId ? ` → <#${parsed.targetChannelId}>` : '';
+      const typeLabel = getTypeLabel(schedule.type, {
+        expression: schedule.expression,
+        runAt: schedule.runAt,
+        channelInfo,
+      });
+
+      await sourceMessage.reply(
+        `✅ スケジュールを追加しました\n\n${typeLabel}\n📝 ${schedule.message}\n🆔 \`${schedule.id}\``
+      );
+    } catch (error) {
+      await sourceMessage.reply(
+        `❌ ${error instanceof Error ? error.message : 'エラーが発生しました'}`
+      );
+    }
+  }
   // Discord APIエラーでプロセスが落ちないようにハンドリング
   client.on('error', (error) => {
     console.error('[xangi] Discord client error:', error.message);
@@ -1558,30 +1704,6 @@ async function main() {
     if (prompt.startsWith('!skip')) {
       skipPermissions = true;
       prompt = prompt.replace(/^!skip\s*/, '').trim();
-    }
-
-    // !discord コマンドの処理
-    if (prompt.startsWith('!discord')) {
-      const result = await handleDiscordCommand(prompt, message);
-      if (result.handled) {
-        if (result.feedback && result.response) {
-          // feedback結果はエージェントのコンテキストに注入
-          // → 元のコマンドと結果を合わせてプロンプトに流す
-          prompt = `ユーザーが「${prompt}」を実行しました。以下がその結果です。この情報を踏まえてユーザーに返答してください。\n\n${result.response}`;
-          // processPromptに流す（下に続く）
-        } else {
-          if (result.response && 'send' in message.channel) {
-            await message.channel.send(result.response);
-          }
-          return;
-        }
-      }
-    }
-
-    // !schedule コマンドの処理
-    if (prompt.startsWith('!schedule')) {
-      await handleScheduleMessage(message, prompt, scheduler, config.scheduler);
-      return;
     }
 
     // Discordリンクからメッセージ内容を取得
@@ -1622,6 +1744,11 @@ async function main() {
     );
 
     const channelId = message.channel.id;
+    if (processingChannels.has(channelId)) {
+      console.log(`[xangi] Channel ${channelId} is already processing a task`);
+      return;
+    }
+    processingChannels.add(channelId);
 
     // チャンネルトピック（概要）をプロンプトに注入
     if (config.discord.injectChannelTopic !== false) {
@@ -1673,6 +1800,8 @@ async function main() {
       }
     } catch (err) {
       console.error('[xangi] Message processing failed:', err);
+    } finally {
+      processingChannels.delete(channelId);
     }
   });
 
@@ -1696,22 +1825,6 @@ async function main() {
         throw new Error(`Channel not found: ${channelId}`);
       }
 
-      // プロンプト内の !discord send コマンドを先に直接実行
-      // （AIに渡すとコマンドが応答に含まれず実行されないため）
-      const promptCommands = extractDiscordSendFromPrompt(prompt);
-      for (const cmd of promptCommands.commands) {
-        console.log(`[scheduler] Executing discord command from prompt: ${cmd.slice(0, 80)}...`);
-        await handleDiscordCommand(cmd, undefined, channelId);
-      }
-
-      // !discord send 以外のテキストが残っていればAIに渡す
-      const remainingPrompt = promptCommands.remaining.trim();
-      if (!remainingPrompt) {
-        // コマンドのみのプロンプトだった場合、AIは不要
-        console.log('[scheduler] Prompt contained only discord commands, skipping agent');
-        return promptCommands.commands.map((c) => `✅ ${c.slice(0, 50)}`).join('\n');
-      }
-
       // 処理中メッセージを送信
       const thinkingMsg = await (
         channel as {
@@ -1721,7 +1834,7 @@ async function main() {
 
       try {
         // タイムスタンプをプロンプトの先頭に注入
-        let agentPrompt = remainingPrompt;
+        let agentPrompt = prompt;
         if (config.discord.injectTimestamp !== false) {
           const d = new Date();
           const now = d.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
@@ -1744,27 +1857,6 @@ async function main() {
         // スケジューラーのセッションは scheduler スコープで保存
         setSession(channelId, newSessionId, 'scheduler');
 
-        // AI応答内の !discord コマンドを処理（sourceMessage なし、channelIdをフォールバック）
-        const feedbackResults = await handleDiscordCommandsInResponse(result, undefined, channelId);
-
-        // フィードバック結果があればエージェントに再注入
-        if (feedbackResults.length > 0) {
-          const feedbackPrompt = `あなたが実行したコマンドの結果が返ってきました。この情報を踏まえて、元の会話の文脈に沿ってユーザーに返答してください。\n\n${feedbackResults.join('\n\n')}`;
-          console.log(
-            `[scheduler] Re-injecting ${feedbackResults.length} feedback result(s) to agent`
-          );
-          const feedbackSession = getSession(channelId);
-          const feedbackRun = await agentRunner.run(feedbackPrompt, {
-            skipPermissions: config.agent.config.skipPermissions ?? false,
-            sessionId: feedbackSession,
-            channelId,
-            appSessionId: schedAppSessionId,
-          });
-          setSession(channelId, feedbackRun.sessionId, 'scheduler');
-          // 再注入後の応答にもコマンドがあれば処理
-          await handleDiscordCommandsInResponse(feedbackRun.result, undefined, channelId);
-        }
-
         // 結果を送信
         const filePaths = extractFilePaths(result);
         const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
@@ -1782,10 +1874,6 @@ async function main() {
         // 最初のパートは既存のthinkingMsgを編集して送信
         const firstChunks = splitMessage(messageParts[0], DISCORD_SAFE_LENGTH);
         await thinkingMsg.edit(firstChunks[0] || '✅');
-        // 最後に送信したメッセージIDを記録（スケジューラー経由）
-        if ('id' in thinkingMsg) {
-          lastSentMessageIds.set(channelId, (thinkingMsg as { id: string }).id);
-        }
         const ch = channel as { send: (content: string) => Promise<unknown> };
         // 最初のパートの残りチャンク
         for (let i = 1; i < firstChunks.length; i++) {
@@ -1958,167 +2046,32 @@ async function handleSkillCommand(
 }
 
 /**
- * テキストから !discord send コマンドを抽出し、残りのテキストを返す
- * スケジューラプロンプトからコマンドを分離するために使用
- * コードブロック内のコマンドは無視する
- */
-function extractDiscordSendFromPrompt(text: string): {
-  commands: string[];
-  remaining: string;
-} {
-  const lines = text.split('\n');
-  const commands: string[] = [];
-  const remainingLines: string[] = [];
-  let inCodeBlock = false;
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    if (line.trim().startsWith('```')) {
-      inCodeBlock = !inCodeBlock;
-      remainingLines.push(line);
-      i++;
-      continue;
-    }
-
-    if (inCodeBlock) {
-      remainingLines.push(line);
-      i++;
-      continue;
-    }
-
-    const trimmed = line.trim();
-    const sendMatch = trimmed.match(/^!discord\s+send\s+<#(\d+)>\s*(.*)/);
-    if (sendMatch) {
-      const firstLineContent = sendMatch[2] ?? '';
-      if (firstLineContent.trim() === '') {
-        // 暗黙マルチライン: 次のコマンド行まで吸収
-        const bodyLines: string[] = [];
-        let inBodyCodeBlock = false;
-        i++;
-        while (i < lines.length) {
-          const bodyLine = lines[i];
-          if (bodyLine.trim().startsWith('```')) {
-            inBodyCodeBlock = !inBodyCodeBlock;
-          }
-          if (
-            !inBodyCodeBlock &&
-            (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-          ) {
-            break;
-          }
-          bodyLines.push(bodyLine);
-          i++;
-        }
-        const fullMessage = bodyLines.join('\n').trim();
-        if (fullMessage) {
-          commands.push(`!discord send <#${sendMatch[1]}> ${fullMessage}`);
-        }
-        continue;
-      } else {
-        // 1行目にテキストあり → 続く行も吸収
-        const bodyLines2: string[] = [firstLineContent];
-        let inBodyCodeBlock2 = false;
-        i++;
-        while (i < lines.length) {
-          const bodyLine = lines[i];
-          if (bodyLine.trim().startsWith('```')) {
-            inBodyCodeBlock2 = !inBodyCodeBlock2;
-          }
-          if (
-            !inBodyCodeBlock2 &&
-            (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-          ) {
-            break;
-          }
-          bodyLines2.push(bodyLine);
-          i++;
-        }
-        const fullMessage2 = bodyLines2.join('\n').trimEnd();
-        commands.push(`!discord send <#${sendMatch[1]}> ${fullMessage2}`);
-        continue;
-      }
-    }
-
-    remainingLines.push(line);
-    i++;
-  }
-
-  return { commands, remaining: remainingLines.join('\n') };
-}
-
-/**
  * 表示用テキストからコマンド行を除去する（コードブロック内は残す）
- * SYSTEM_COMMAND:, !discord, !schedule で始まる行を除去
- * !discord send の複数行メッセージ（続く行）も除去
+ * SYSTEM_COMMAND: で始まる行を除去
  */
 function stripCommandsFromDisplay(text: string): string {
   const lines = text.split('\n');
   const result: string[] = [];
   let inCodeBlock = false;
-  let i = 0;
 
-  while (i < lines.length) {
-    const line = lines[i];
-
+  for (const line of lines) {
     if (line.trim().startsWith('```')) {
       inCodeBlock = !inCodeBlock;
       result.push(line);
-      i++;
       continue;
     }
 
     if (inCodeBlock) {
       result.push(line);
-      i++;
       continue;
     }
-
-    const trimmed = line.trim();
 
     // SYSTEM_COMMAND: 行を除去
-    if (trimmed.startsWith('SYSTEM_COMMAND:')) {
-      i++;
-      continue;
-    }
-
-    // !discord send の複数行対応: コマンド行と続く行を除去
-    const sendMatch = trimmed.match(/^!discord\s+send\s+<#\d+>\s*(.*)/);
-    if (sendMatch) {
-      // 続く行も除去（次のコマンド行まで）
-      i++;
-      let inBodyCodeBlock = false;
-      while (i < lines.length) {
-        const bodyLine = lines[i];
-        if (bodyLine.trim().startsWith('```')) {
-          inBodyCodeBlock = !inBodyCodeBlock;
-        }
-        if (
-          !inBodyCodeBlock &&
-          (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-        ) {
-          break;
-        }
-        i++;
-      }
-      continue;
-    }
-
-    // その他の !discord コマンド行を除去
-    if (trimmed.startsWith('!discord ')) {
-      i++;
-      continue;
-    }
-
-    // !schedule コマンド行を除去
-    if (trimmed === '!schedule' || trimmed.startsWith('!schedule ')) {
-      i++;
+    if (line.trim().startsWith('SYSTEM_COMMAND:')) {
       continue;
     }
 
     result.push(line);
-    i++;
   }
 
   return result.join('\n').trim();
@@ -2207,8 +2160,8 @@ async function processPrompt(
               // ツール実行履歴に追加
               const inputSummary = formatToolInput(toolName, toolInput);
               toolHistory.push(`🔧 ${toolName}${inputSummary}`);
+              const toolDisplay = toolHistory.join('\n');
               if (!firstTextReceived) {
-                const toolDisplay = toolHistory.join('\n');
                 thinkingMessage.edit(`🤔 考え中...\n${toolDisplay}`).catch(() => {});
               }
             },
@@ -2278,8 +2231,7 @@ async function processPrompt(
     const filePaths = extractFilePaths(result);
     const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
 
-    // SYSTEM_COMMAND: 行と !discord / !schedule コマンド行を表示テキストから除去
-    // コードブロック内のコマンドは残す（表示用テキストなので消さない）
+    // SYSTEM_COMMAND: 行を表示テキストから除去（コードブロック内は残す）
     const cleanText = stripCommandsFromDisplay(displayText);
 
     // === セパレータで明示的に分割（content-digest等で複数投稿を1応答に含める用途）
@@ -2298,23 +2250,26 @@ async function processPrompt(
       content: firstChunks[0] || '✅',
       ...(showButtons && { components: [createCompletedButtons()] }),
     });
-    // 最後に送信したメッセージIDを記録
-    if (replyMessage) {
-      lastSentMessageIds.set(message.channel.id, replyMessage.id);
-    }
+    lastSentMessageIds.set(message.channel.id, replyMessage.id);
     if ('send' in message.channel) {
       const channel = message.channel as unknown as {
-        send: (content: string) => Promise<unknown>;
+        send: (content: string) => Promise<{ id?: string }>;
       };
       // 最初のパートの残りチャンク
       for (let i = 1; i < firstChunks.length; i++) {
-        await channel.send(firstChunks[i]);
+        const sent = await channel.send(firstChunks[i]);
+        if (sent.id) {
+          lastSentMessageIds.set(message.channel.id, sent.id);
+        }
       }
       // 2つ目以降のパートは新規メッセージとして送信
       for (let p = 1; p < messageParts.length; p++) {
         const chunks = splitMessage(messageParts[p], DISCORD_SAFE_LENGTH);
         for (const chunk of chunks) {
-          await channel.send(chunk);
+          const sent = await channel.send(chunk);
+          if (sent.id) {
+            lastSentMessageIds.set(message.channel.id, sent.id);
+          }
         }
       }
     }
@@ -2337,7 +2292,6 @@ async function processPrompt(
       }
     }
 
-    // AIの応答を返す（!discord コマンド処理用）
     return result;
   } catch (error) {
     if (error instanceof Error && error.message === 'Request cancelled by user') {
@@ -2550,313 +2504,6 @@ async function handleScheduleCommand(
       }
       return;
     }
-  }
-}
-
-async function handleScheduleMessage(
-  message: Message,
-  prompt: string,
-  scheduler: Scheduler,
-  schedulerConfig?: { enabled: boolean; startupEnabled: boolean }
-): Promise<void> {
-  const args = prompt.replace(/^!schedule\s*/, '').trim();
-  const channelId = message.channel.id;
-
-  // !schedule (引数なし) or !schedule list → 一覧（全件表示）
-  if (!args || args === 'list') {
-    const schedules = scheduler.list();
-    const content = formatScheduleList(schedules, schedulerConfig);
-    if (content.length <= DISCORD_MAX_LENGTH) {
-      await message.reply(content.replaceAll(SCHEDULE_SEPARATOR, ''));
-    } else {
-      const chunks = splitScheduleContent(content, DISCORD_SAFE_LENGTH);
-      for (const chunk of chunks) {
-        await message.reply(chunk);
-      }
-    }
-    return;
-  }
-
-  // !schedule remove <id|番号> [番号2] [番号3] ...
-  if (args.startsWith('remove ') || args.startsWith('delete ') || args.startsWith('rm ')) {
-    const parts = args.split(/\s+/).slice(1).filter(Boolean);
-    if (parts.length === 0) {
-      await message.reply('使い方: `!schedule remove <ID または 番号> [番号2] ...`');
-      return;
-    }
-
-    const schedules = scheduler.list();
-    const deletedIds: string[] = [];
-    const errors: string[] = [];
-
-    // 番号を大きい順にソート（削除時のずれを防ぐ）
-    const targets = parts
-      .map((p) => {
-        const num = parseInt(p, 10);
-        if (!isNaN(num) && num > 0 && !p.startsWith('sch_')) {
-          if (num > schedules.length) {
-            errors.push(`番号 ${num} は範囲外`);
-            return null;
-          }
-          return { index: num, id: schedules[num - 1].id };
-        }
-        return { index: 0, id: p };
-      })
-      .filter((t): t is { index: number; id: string } => t !== null)
-      .sort((a, b) => b.index - a.index); // 大きい番号から削除
-
-    for (const target of targets) {
-      if (scheduler.remove(target.id)) {
-        deletedIds.push(target.id);
-      } else {
-        errors.push(`ID ${target.id} が見つからない`);
-      }
-    }
-
-    const remaining = scheduler.list();
-    let response = '';
-    if (deletedIds.length > 0) {
-      response += `✅ ${deletedIds.length}件削除しました\n\n`;
-    }
-    if (errors.length > 0) {
-      response += `⚠️ エラー: ${errors.join(', ')}\n\n`;
-    }
-    response += formatScheduleList(remaining, schedulerConfig);
-    // 2000文字制限対応
-    if (response.length <= DISCORD_MAX_LENGTH) {
-      await message.reply(response.replaceAll(SCHEDULE_SEPARATOR, ''));
-    } else {
-      const chunks = splitScheduleContent(response, DISCORD_SAFE_LENGTH);
-      for (const chunk of chunks) {
-        await message.reply(chunk);
-      }
-    }
-    return;
-  }
-
-  // !schedule toggle <id|番号>
-  if (args.startsWith('toggle ')) {
-    const idOrIndex = args.split(/\s+/)[1];
-    if (!idOrIndex) {
-      await message.reply('使い方: `!schedule toggle <ID または 番号>`');
-      return;
-    }
-
-    let targetId = idOrIndex;
-    const indexNum = parseInt(idOrIndex, 10);
-    if (!isNaN(indexNum) && indexNum > 0 && !idOrIndex.startsWith('sch_')) {
-      const schedules = scheduler.list(channelId);
-      if (indexNum > schedules.length) {
-        await message.reply(`❌ 番号 ${indexNum} は範囲外です（1〜${schedules.length}）`);
-        return;
-      }
-      targetId = schedules[indexNum - 1].id;
-    }
-
-    const schedule = scheduler.toggle(targetId);
-    if (schedule) {
-      const status = schedule.enabled ? '✅ 有効化' : '⏸️ 無効化';
-      const all = scheduler.list(channelId);
-      const listContent = formatScheduleList(all, schedulerConfig).replaceAll(
-        SCHEDULE_SEPARATOR,
-        ''
-      );
-      await message.reply(`${status}しました: ${targetId}\n\n${listContent}`);
-    } else {
-      await message.reply(`❌ ID \`${targetId}\` が見つかりません`);
-    }
-    return;
-  }
-
-  // !schedule add <input> or !schedule <input> (addなしでも追加)
-  const input = args.startsWith('add ') ? args.replace(/^add\s+/, '') : args;
-  const parsed = parseScheduleInput(input);
-  if (!parsed) {
-    await message.reply(
-      '❌ 入力を解析できませんでした\n\n' +
-        '**対応フォーマット:**\n' +
-        '• `!schedule 30分後 メッセージ`\n' +
-        '• `!schedule 15:00 メッセージ`\n' +
-        '• `!schedule 毎日 9:00 メッセージ`\n' +
-        '• `!schedule 毎週月曜 10:00 メッセージ`\n' +
-        '• `!schedule cron 0 9 * * * メッセージ`\n' +
-        '• `!schedule list` / `!schedule remove <ID>`'
-    );
-    return;
-  }
-
-  try {
-    const targetChannel = parsed.targetChannelId || channelId;
-    const schedule = scheduler.add({
-      ...parsed,
-      channelId: targetChannel,
-      platform: 'discord' as Platform,
-    });
-
-    const channelInfo = parsed.targetChannelId ? ` → <#${parsed.targetChannelId}>` : '';
-    const typeLabel = getTypeLabel(schedule.type, {
-      expression: schedule.expression,
-      runAt: schedule.runAt,
-      channelInfo,
-    });
-
-    await message.reply(
-      `✅ スケジュールを追加しました\n\n${typeLabel}\n📝 ${schedule.message}\n🆔 \`${schedule.id}\``
-    );
-  } catch (error) {
-    await message.reply(`❌ ${error instanceof Error ? error.message : 'エラーが発生しました'}`);
-  }
-}
-
-/**
- * AI応答内の !schedule コマンドを実行
- */
-async function executeScheduleFromResponse(
-  text: string,
-  sourceMessage: Message,
-  scheduler: Scheduler,
-  schedulerConfig?: { enabled: boolean; startupEnabled: boolean }
-): Promise<void> {
-  const args = text.replace(/^!schedule\s*/, '').trim();
-  const channelId = sourceMessage.channel.id;
-  const channel = sourceMessage.channel;
-
-  // list コマンド（全件表示）
-  if (!args || args === 'list') {
-    const schedules = scheduler.list();
-    const content = formatScheduleList(schedules, schedulerConfig);
-    if ('send' in channel) {
-      const sendFn = (channel as { send: (content: string) => Promise<unknown> }).send.bind(
-        channel
-      );
-      // 2000文字制限対応: 分割送信
-      if (content.length <= DISCORD_MAX_LENGTH) {
-        await sendFn(content.replaceAll(SCHEDULE_SEPARATOR, ''));
-      } else {
-        const chunks = splitScheduleContent(content, DISCORD_SAFE_LENGTH);
-        for (const chunk of chunks) {
-          await sendFn(chunk);
-        }
-      }
-    }
-    return;
-  }
-
-  // remove コマンド（複数対応）
-  if (args.startsWith('remove ') || args.startsWith('delete ') || args.startsWith('rm ')) {
-    const parts = args.split(/\s+/).slice(1).filter(Boolean);
-    if (parts.length === 0) return;
-
-    const schedules = scheduler.list();
-    const deletedIds: string[] = [];
-
-    // 番号を大きい順にソート（削除時のずれを防ぐ）
-    const targets = parts
-      .map((p) => {
-        const num = parseInt(p, 10);
-        if (!isNaN(num) && num > 0 && !p.startsWith('sch_')) {
-          if (num > schedules.length) return null;
-          return { index: num, id: schedules[num - 1].id };
-        }
-        return { index: 0, id: p };
-      })
-      .filter((t): t is { index: number; id: string } => t !== null)
-      .sort((a, b) => b.index - a.index);
-
-    for (const target of targets) {
-      if (scheduler.remove(target.id)) {
-        deletedIds.push(target.id);
-      }
-    }
-
-    if ('send' in channel && deletedIds.length > 0) {
-      const remaining = scheduler.list();
-      const content = `✅ ${deletedIds.length}件削除しました\n\n${formatScheduleList(remaining, schedulerConfig)}`;
-      const sendFn = (channel as { send: (content: string) => Promise<unknown> }).send.bind(
-        channel
-      );
-      if (content.length <= DISCORD_MAX_LENGTH) {
-        await sendFn(content.replaceAll(SCHEDULE_SEPARATOR, ''));
-      } else {
-        const chunks = splitScheduleContent(content, DISCORD_SAFE_LENGTH);
-        for (const chunk of chunks) {
-          await sendFn(chunk);
-        }
-      }
-    }
-    return;
-  }
-
-  // toggle コマンド
-  if (args.startsWith('toggle ')) {
-    const idOrIndex = args.split(/\s+/)[1];
-    if (!idOrIndex) return;
-
-    let targetId = idOrIndex;
-    const indexNum = parseInt(idOrIndex, 10);
-    if (!isNaN(indexNum) && indexNum > 0 && !idOrIndex.startsWith('sch_')) {
-      const schedules = scheduler.list(channelId);
-      if (indexNum > schedules.length) {
-        if ('send' in channel) {
-          await (channel as { send: (content: string) => Promise<unknown> }).send(
-            `❌ 番号 ${indexNum} は範囲外です（1〜${schedules.length}）`
-          );
-        }
-        return;
-      }
-      targetId = schedules[indexNum - 1].id;
-    }
-
-    const schedule = scheduler.toggle(targetId);
-    if ('send' in channel) {
-      if (schedule) {
-        const status = schedule.enabled ? '✅ 有効化' : '⏸️ 無効化';
-        const all = scheduler.list(channelId);
-        const listContent = formatScheduleList(all, schedulerConfig).replaceAll(
-          SCHEDULE_SEPARATOR,
-          ''
-        );
-        await (channel as { send: (content: string) => Promise<unknown> }).send(
-          `${status}しました: ${targetId}\n\n${listContent}`
-        );
-      } else {
-        await (channel as { send: (content: string) => Promise<unknown> }).send(
-          `❌ ID \`${targetId}\` が見つかりません`
-        );
-      }
-    }
-    return;
-  }
-
-  const input = args.startsWith('add ') ? args.replace(/^add\s+/, '') : args;
-  const parsed = parseScheduleInput(input);
-  if (!parsed) {
-    console.log(`[xangi] Failed to parse schedule input: ${input}`);
-    return;
-  }
-
-  try {
-    const targetChannel = parsed.targetChannelId || channelId;
-    const schedule = scheduler.add({
-      ...parsed,
-      channelId: targetChannel,
-      platform: 'discord' as Platform,
-    });
-
-    const channelInfo = parsed.targetChannelId ? ` → <#${parsed.targetChannelId}>` : '';
-    const typeLabel = getTypeLabel(schedule.type, {
-      expression: schedule.expression,
-      runAt: schedule.runAt,
-      channelInfo,
-    });
-
-    if ('send' in channel) {
-      await (channel as { send: (content: string) => Promise<unknown> }).send(
-        `✅ スケジュールを追加しました\n\n${typeLabel}\n📝 ${schedule.message}\n🆔 \`${schedule.id}\``
-      );
-    }
-  } catch (error) {
-    console.error('[xangi] Failed to add schedule from response:', error);
   }
 }
 

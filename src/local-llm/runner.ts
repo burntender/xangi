@@ -599,6 +599,9 @@ export class LocalLlmRunner implements AgentRunner {
             `[local-llm] Tool call: ${toolCall.name}(${JSON.stringify(toolCall.arguments).slice(0, 200)})`
           );
 
+          // Discordにツール実行中を通知
+          callbacks.onToolUse?.(toolCall.name, toolCall.arguments as Record<string, unknown>);
+
           // 危険コマンド承認チェック（承認サーバー経由、Claude Codeと同じ仕組み）
           const approvalResult2 = await checkApprovalServer(toolCall.name, toolCall.arguments);
           if (approvalResult2 === 'deny') {

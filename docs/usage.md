@@ -305,8 +305,9 @@ xangi-cmdはxangiプロセス内のtool-server（HTTP API）に中継します�
 
 | コマンド    | 説明             |
 | ----------- | ---------------- |
-| `/settings` | 現在の設定を表示 |
-| `/restart`  | ボットを再起動   |
+| `/settings`  | 現在の設定を表示                               |
+| `/restart`   | ボットを再起動                                 |
+| `/autoreply` | このチャンネルのメンションなし応答をトグル（再起動不要） |
 
 ### バックエンド動的切り替え
 
@@ -356,6 +357,9 @@ AIは `.env` ファイルを編集して設定を変更できます：
 「このチャンネルでも応答して」
 → AIが AUTO_REPLY_CHANNELS を編集 → 再起動
 ```
+
+`/autoreply` コマンドでもメンションなし応答をチャンネルごとに切り替えられます（再起動不要、`.env` にも永続化）。
+このコマンドを無効にするには `.env` に `ALLOW_AUTOREPLY_COMMAND=false` を設定してください（デフォルト: 有効）。
 
 ### システムコマンド
 
@@ -713,6 +717,8 @@ AIエージェント（CLI spawn / Local LLM exec）に渡す環境変数は `sr
 | `AUTO_REPLY_CHANNELS` | メンションなしで応答するチャンネルID（カンマ区切り） | - |
 | `DISCORD_STREAMING` | ストリーミング出力 | `true` |
 | `DISCORD_SHOW_THINKING` | 思考過程を表示 | `true` |
+| `DISCORD_SHOW_BUTTONS` | Stop/New Sessionボタン表示 | `true` |
+| `ALLOW_AUTOREPLY_COMMAND` | `/autoreply` コマンドの有効化 | `true` |
 | `INJECT_CHANNEL_TOPIC` | チャンネルトピックをプロンプトに注入 | `true` |
 | `INJECT_TIMESTAMP` | 現在時刻をプロンプトに注入 | `true` |
 
@@ -726,11 +732,35 @@ AIエージェント（CLI spawn / Local LLM exec）に渡す環境変数は `sr
 | `XANGI_WORKSPACE` | ワークスペースのホスト側パス（Docker実行時） | `./workspace` |
 | `SKIP_PERMISSIONS` | デフォルトで許可スキップ | `false` |
 | `TIMEOUT_MS` | タイムアウト（ミリ秒） | `300000` |
+| `ALLOWED_BACKENDS` | `/backend` で切り替え許可するバックエンド（カンマ区切り） | - |
+| `ALLOWED_MODELS` | `/backend` で切り替え許可するモデル（カンマ区切り） | - |
+| `CHANNEL_OVERRIDES` | チャンネル別バックエンド設定（JSON） | - |
 | `PERSISTENT_MODE` | 常駐プロセスモード | `true` |
 | `MAX_PROCESSES` | 同時実行プロセス数の上限 | `10` |
 | `IDLE_TIMEOUT_MS` | アイドルプロセスの自動終了時間 | `1800000` |
-| `DATA_DIR` | データ保存ディレクトリ | `.xangi` |
+| `DATA_DIR` | データ保存ディレクトリ（スケジュール・セッション等） | `WORKSPACE_PATH/.xangi` |
 | `GH_TOKEN` | GitHub CLIトークン | - |
+
+### ツール承認
+
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `APPROVAL_ENABLED` | 危険コマンド実行前にDiscord/Slackで承認を求める | `false` |
+| `APPROVAL_SERVER_PORT` | 承認サーバーのリッスンポート | `18181` |
+
+### WebチャットUI
+
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `WEB_CHAT_ENABLED` | WebチャットUIの有効化 | `false` |
+| `WEB_CHAT_PORT` | WebチャットUIのポート | `18888` |
+
+### スケジューラ
+
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `SCHEDULER_ENABLED` | スケジューラ有効化 | `true` |
+| `STARTUP_ENABLED` | スタートアップタスク有効化 | `true` |
 
 ### GitHub App認証（オプション）
 
@@ -746,7 +776,10 @@ GitHub App設定があれば、`gh` CLI実行時にインストールトーク�
 
 **Docker環境:** 秘密鍵は `/secrets/github-app.pem` に自動マウントされます。`.env` にはホスト側のパスを設定してください。
 
-**セキュリティ:** トークン生成に失敗した場合、PATへのフォールバックは行わずエラーになります。`gh` 実行時にツール表示に `🔑App` バッジが表示されます。
+**セキュリティ:**
+- 秘密鍵は起動時にメモリに読み込まれ、AIエージェントからはファイルとして直接アクセスできません
+- トークン生成はtool-serverのHTTPエンドポイント（`/github-token`）経由で行われ、AIエージェントが取得できるのは短寿命のインストールトークン（1時間有効）のみです
+- トークン生成に失敗した場合、PATへのフォールバックは行わずエラーになります
 
 ### Local LLM（`AGENT_BACKEND=local-llm` 時）
 
